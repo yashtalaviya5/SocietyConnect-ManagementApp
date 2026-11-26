@@ -1,0 +1,308 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function verified() {
+      return signedIn() && request.auth.token.email_verified == true;
+    }
+
+    function userPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function societyPath(societyId) {
+      return /databases/$(database)/documents/societies/$(societyId);
+    }
+
+    function flatPath(flatId) {
+      return /databases/$(database)/documents/flats/$(flatId);
+    }
+
+    function hasProfile() {
+      return verified() && exists(userPath(request.auth.uid));
+    }
+
+    function profile() {
+      return get(userPath(request.auth.uid)).data;
+    }
+
+    function isAdmin(societyId) {
+      return hasProfile()
+        && profile().isActive == true
+        && profile().role == 'admin'
+        && profile().societyId == societyId;
+    }
+
+    function isResident(societyId) {
+      return hasProfile()
+        && profile().isActive == true
+        && profile().role == 'resident'
+        && profile().societyId == societyId;
+    }
+
+    function isMember(societyId) {
+      return isAdmin(societyId) || isResident(societyId);
+    }
+
+    // Flat and maintenance IDs are deterministic and start with the society ID.
+    // This also authorizes an admin's duplicate-check get() when the target
+    // document does not exist yet (and therefore has no resource.data).
+    function adminOwnsDocumentId(documentId) {
+      return hasProfile()
+        && profile().isActive == true
+        && profile().role == 'admin'
+        && profile().societyId is string
+        && documentId.matches('^' + profile().societyId + '_.*');
+    }
+
+    function profileAfter() {
+      return getAfter(userPath(request.auth.uid)).data;
+    }
+
+    match /societies/{societyId} {
+      // Exact code lookup supports onboarding; collection enumeration is never public.
+      allow get: if verified();
+      allow list: if isMember(societyId);
+      allow create: if verified()
+        && request.resource.data.societyId == societyId
+        && request.resource.data.createdBy == request.auth.uid
+        && existsAfter(userPath(request.auth.uid))
+        && profileAfter().role == 'admin'
+        && profileAfter().societyId == societyId;
+      allow update: if isAdmin(societyId)
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.societyId == societyId;
+      allow delete: if false;
+
+      match /amenity_slots/{slotId} {
+        // Slot documents contain no personal fields and are readable only in the member's society.
+        allow get, list: if isMember(societyId);
+        allow create: if verified()
+          && isResident(societyId)
+          && request.resource.data.societyId == societyId
+          && request.resource.data.residentId == request.auth.uid
+          && request.resource.data.requestId is string
+          && existsAfter(/databases/$(database)/documents/amenity_requests/$(request.resource.data.requestId))
+          && getAfter(/databases/$(database)/documents/amenity_requests/$(request.resource.data.requestId)).data.societyId == societyId
+          && getAfter(/databases/$(database)/documents/amenity_requests/$(request.resource.data.requestId)).data.residentId == request.auth.uid
+          && getAfter(/databases/$(database)/documents/amenity_requests/$(request.resource.data.requestId)).data.status == 'Pending';
+        allow update: if false;
+        allow delete: if isAdmin(societyId);
+      }
+    }
+
+    match /users/{userId} {
+      allow get: if verified() && (
+        request.auth.uid == userId ||
+        (resource.data.societyId is string && isAdmin(resource.data.societyId))
+      );
+      allow list: if verified()
+        && resource.data.societyId is string
+        && isAdmin(resource.data.societyId);
+      allow create: if verified()
+        && request.auth.uid == userId
+        && request.resource.data.userId == userId
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.isActive == true
+        && request.resource.data.role in ['admin', 'resident']
+        && (
+          (request.resource.data.role == 'admin'
+            && existsAfter(societyPath(request.resource.data.societyId))
+            && getAfter(societyPath(request.resource.data.societyId)).data.createdBy == userId)
+          ||
+          (request.resource.data.role == 'resident'
+            && exists(societyPath(request.resource.data.societyId))
+            && request.resource.data.flatId is string
+            && existsAfter(flatPath(request.resource.data.flatId))
+            && getAfter(flatPath(request.resource.data.flatId)).data.societyId == request.resource.data.societyId
+            && getAfter(flatPath(request.resource.data.flatId)).data.residentId == userId
+            && getAfter(flatPath(request.resource.data.flatId)).data.status == 'Occupied')
+        );
+      allow update: if verified() && (
+        (request.auth.uid == userId
+          && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['fullName', 'mobile', 'themeMode', 'updatedAt'])
+          && (!request.resource.data.diff(resource.data).affectedKeys()
+                .hasAny(['themeMode'])
+            || request.resource.data.themeMode in ['system', 'light', 'dark']))
+        ||
+        (resource.data.societyId is string
+          && isAdmin(resource.data.societyId)
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.societyId == resource.data.societyId
+          && request.resource.data.email == resource.data.email)
+      );
+      allow delete: if false;
+
+      match /fcm_tokens/{tokenId} {
+        // A signed-in user can register and remove tokens only under their own
+        // profile. Token documents are never readable from the client.
+        allow create, update: if verified()
+          && request.auth.uid == userId
+          && exists(userPath(userId))
+          && get(userPath(userId)).data.isActive == true
+          && request.resource.data.keys().hasOnly(['fid', 'platform', 'updatedAt'])
+          && request.resource.data.fid is string
+          && request.resource.data.fid.size() <= 256
+          && request.resource.data.fid == tokenId
+          && request.resource.data.platform == 'android'
+          && request.resource.data.updatedAt is timestamp;
+        allow delete: if verified() && request.auth.uid == userId;
+      }
+    }
+
+    match /flats/{flatId} {
+      // Vacant flat documents are readable before sign-up so registration can
+      // list choices and reject unavailable flats before creating an account.
+      allow get: if verified() && (
+        adminOwnsDocumentId(flatId)
+        || (resource.data.societyId is string && isAdmin(resource.data.societyId))
+        || resource.data.status == 'Vacant'
+        || (hasProfile()
+          && profile().role == 'resident'
+          && profile().societyId == resource.data.societyId
+          && profile().flatId == flatId)
+      );
+      allow list: if resource.data.status == 'Vacant' || (verified() && (
+        (resource.data.societyId is string && isAdmin(resource.data.societyId))
+        || resource.data.status == 'Vacant'
+        || (hasProfile()
+          && profile().role == 'resident'
+          && profile().societyId == resource.data.societyId
+          && profile().flatId == flatId)
+      ));
+      allow create: if request.resource.data.societyId is string
+        && isAdmin(request.resource.data.societyId)
+        && request.resource.data.status in ['Vacant', 'Occupied'];
+      allow update: if (
+        resource.data.societyId is string
+        && isAdmin(resource.data.societyId)
+      ) || (
+        verified()
+        && resource.data.status == 'Vacant'
+        && request.resource.data.status == 'Occupied'
+        && request.resource.data.residentId == request.auth.uid
+        && request.resource.data.societyId == resource.data.societyId
+        && existsAfter(userPath(request.auth.uid))
+        && profileAfter().role == 'resident'
+        && profileAfter().societyId == resource.data.societyId
+        && profileAfter().flatId == flatId
+      );
+      allow delete: if resource.data.societyId is string
+        && isAdmin(resource.data.societyId);
+    }
+
+    match /maintenance/{maintenanceId} {
+      allow get: if verified() && (
+        adminOwnsDocumentId(maintenanceId)
+        || (
+        (resource.data.societyId is string && isAdmin(resource.data.societyId))
+        || (hasProfile()
+          && profile().role == 'resident'
+          && resource.data.societyId == profile().societyId
+          && resource.data.residentId == request.auth.uid))
+      );
+      allow list: if verified() && (
+        (resource.data.societyId is string && isAdmin(resource.data.societyId))
+        || (hasProfile()
+          && profile().role == 'resident'
+          && resource.data.societyId == profile().societyId
+          && resource.data.residentId == request.auth.uid)
+      );
+      allow create, update: if request.resource != null
+        && request.resource.data.societyId is string
+        && isAdmin(request.resource.data.societyId);
+      allow delete: if false;
+    }
+
+    match /notices/{noticeId} {
+      allow read: if verified() && resource.data.societyId is string
+        && isMember(resource.data.societyId);
+      allow create: if request.resource.data.societyId is string
+        && isAdmin(request.resource.data.societyId);
+      allow update, delete: if resource.data.societyId is string
+        && isAdmin(resource.data.societyId);
+    }
+
+    match /events/{eventId} {
+      allow read: if verified() && resource.data.societyId is string
+        && isMember(resource.data.societyId);
+      allow create: if request.resource.data.societyId is string
+        && isAdmin(request.resource.data.societyId);
+      allow update, delete: if resource.data.societyId is string
+        && isAdmin(resource.data.societyId);
+    }
+
+    match /complaints/{complaintId} {
+      allow read: if verified() && (
+        (resource.data.societyId is string && isAdmin(resource.data.societyId))
+        || (hasProfile()
+          && profile().role == 'resident'
+          && resource.data.societyId == profile().societyId
+          && resource.data.residentId == request.auth.uid)
+      );
+      allow create: if verified()
+        && hasProfile()
+        && profile().role == 'resident'
+        && request.resource.data.societyId == profile().societyId
+        && request.resource.data.residentId == request.auth.uid;
+      allow update: if resource.data.societyId is string
+        && isAdmin(resource.data.societyId)
+        && request.resource.data.societyId == resource.data.societyId
+        && request.resource.data.residentId == resource.data.residentId;
+      allow delete: if false;
+    }
+
+    match /amenity_requests/{requestId} {
+      allow read: if verified() && (
+        (resource.data.societyId is string && isAdmin(resource.data.societyId))
+        || (hasProfile()
+          && profile().role == 'resident'
+          && resource.data.societyId == profile().societyId
+          && resource.data.residentId == request.auth.uid)
+      );
+      allow create: if verified()
+        && hasProfile()
+        && profile().role == 'resident'
+        && request.resource.data.societyId == profile().societyId
+        && request.resource.data.residentId == request.auth.uid;
+      allow update: if resource.data.societyId is string
+        && isAdmin(resource.data.societyId)
+        && request.resource.data.societyId == resource.data.societyId
+        && request.resource.data.residentId == resource.data.residentId;
+      allow delete: if false;
+    }
+
+    match /notifications/{notificationId} {
+      allow read: if verified()
+        && resource.data.userId == request.auth.uid;
+      allow update: if verified()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead']);
+      allow create: if request.resource.data.societyId is string
+        && request.resource.data.userId is string
+        && isAdmin(request.resource.data.societyId)
+        && exists(userPath(request.resource.data.userId))
+        && get(userPath(request.resource.data.userId)).data.societyId
+          == request.resource.data.societyId;
+      allow delete: if false;
+    }
+
+    match /activity_logs/{activityId} {
+      allow read: if resource.data.societyId is string
+        && isAdmin(resource.data.societyId);
+      allow create: if verified()
+        && request.resource.data.userId == request.auth.uid
+        && (
+          isAdmin(request.resource.data.societyId)
+          || (!exists(userPath(request.auth.uid))
+            && existsAfter(userPath(request.auth.uid))
+            && profileAfter().societyId == request.resource.data.societyId)
+        );
+      allow update, delete: if false;
+    }
+  }
+}
