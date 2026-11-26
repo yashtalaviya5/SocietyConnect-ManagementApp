@@ -7,7 +7,9 @@
 build/
 functions/node_modules/
 coverage/
+lib/firebase_options.dart
 android/.gradle/
+android/app/google-services.json
 android/local.properties
 android/key.properties
 **/GeneratedPluginRegistrant.java
